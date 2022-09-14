@@ -1,0 +1,6 @@
+[
+    {
+        "caption": "Go Test: Run tests",
+        "command": "go_test_run"
+    }
+]
