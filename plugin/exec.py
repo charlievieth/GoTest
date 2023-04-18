@@ -157,7 +157,8 @@ if __name__ == "__main__":
             print("###")
 
     # ap = AsyncProcess(["go", "version"], callback)
-    ap = AsyncProcess(["sleep", "10"], callback, timeout=1)
+    # ap = AsyncProcess(["sleep", "10"], callback, timeout=1)
+    ap = AsyncProcess(["does-not-exist", "10"], callback, timeout=1)
     print("START")
     ap.run()
     # time.sleep(0.20)

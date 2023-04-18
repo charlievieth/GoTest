@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,10 +13,12 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/charlievieth/buildutil"
 	"github.com/charlievieth/buildutil/contextutil"
@@ -101,6 +104,9 @@ func declsToDefinitions(fset *token.FileSet, decls []*ast.FuncDecl) []*FuncDefin
 }
 
 type ListTestsResponse struct {
+	PkgName    string            `json:"pkg_name"`
+	PkgRoot    string            `json:"pkg_root"`
+	GoEnv      *GoEnv            `json:"go_env,omitempty"`
 	Tests      []*FuncDefinition `json:"tests,omitempty"`
 	Benchmarks []*FuncDefinition `json:"benchmarks,omitempty"`
 	Examples   []*FuncDefinition `json:"examples,omitempty"`
@@ -113,9 +119,16 @@ func ListTests(ctxt *build.Context, dir string) (*ListTestsResponse, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// TODO: log the error?
+	pkgRoot, _ := contextutil.FindProjectRoot(ctxt, dir)
+	if pkgRoot == "" {
+		pkgRoot = filepath.Clean(dir)
+	}
+
 	names := append(pkg.TestGoFiles, pkg.XTestGoFiles...)
 	if len(names) == 0 {
-		return &ListTestsResponse{}, nil
+		return &ListTestsResponse{PkgName: pkg.Name, PkgRoot: pkgRoot}, nil
 	}
 
 	errs := make([]error, len(names))
@@ -145,6 +158,9 @@ func ListTests(ctxt *build.Context, dir string) (*ListTestsResponse, error) {
 	}
 
 	res := &ListTestsResponse{
+		PkgName:    pkg.Name,
+		PkgRoot:    pkgRoot,
+		GoEnv:      DiffGoEnv(&build.Default, ctxt),
 		Tests:      declsToDefinitions(fset, v.Tests),
 		Benchmarks: declsToDefinitions(fset, v.Benchmarks),
 		Examples:   declsToDefinitions(fset, v.Examples),
@@ -182,6 +198,8 @@ func (v *FuncVisitor) Visit(node ast.Node) (w ast.Visitor) {
 	return v
 }
 
+// TODO: use `findcall -name NAME *.go` to find references
+// where findcall is "golang.org/x/tools/go/analysis/passes/findcall/cmd/findcall"
 func ContainingFunction(filename string, src interface{}, line, column int) (string, error) {
 	fset := token.NewFileSet()
 	af, err := parser.ParseFile(fset, filename, src, parser.SkipObjectResolution)
@@ -221,6 +239,69 @@ func ContainingFunction(filename string, src interface{}, line, column int) (str
 	return "", &NoContainingFunctionError{filename, line, column}
 }
 
+type TestConfig struct {
+	Verbose bool
+	Short   bool
+	Race    bool
+}
+
+type Event struct {
+	Time    *time.Time `json:",omitempty"`
+	Action  string
+	Package string   `json:",omitempty"`
+	Test    string   `json:",omitempty"`
+	Elapsed *float64 `json:",omitempty"`
+	Output  *string  `json:",omitempty"`
+}
+
+// func Test2JsonExe(ctxt *build.Context) (string, error) {
+// 	goroot := runtime.GOROOT()
+// 	if !sameFile(ctxt.GOROOT, goroot) {
+// 		exe, err := exec.LookPath(filepath.Join(
+// 			ctxt.GOROOT, "pkg", "tool", runtime.GOOS+"_"+runtime.GOARCH, "test2json",
+// 		))
+// 		if err == nil {
+// 			return exe, nil
+// 		}
+// 	}
+// 	return exec.LookPath(filepath.Join(
+// 		goroot, "pkg", "tool", runtime.GOOS+"_"+runtime.GOARCH, "test2json",
+// 	))
+// }
+
+func RunTests(ctxt *build.Context, dirname string, args ...string) ([]Event, error) {
+	// test2json := filepath.Join(runtime.GOROOT(), "pkg", "tool", runtime.GOOS+"_"+runtime.GOARCH, "test2json")
+	// tmpdir, err := os.MkdirTemp("", "gotest-util-*")
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// defer os.RemoveAll(tmpdir)
+	//
+	// stdout, err := os.Create(tmpdir + "/stdout.out")
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// defer stdout.Close()
+	//
+	// stderr, err := os.Create(tmpdir + "/stderr.out")
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// defer stderr.Close()
+
+	var stdout bytes.Buffer
+	cmd := buildutil.GoCommand(ctxt, "go", append([]string{"test"}, args...)...)
+	cmd.Dir = dirname
+	cmd.Stdout = &stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, err // WARN: include STDERR
+	}
+
+	return nil, nil
+}
+
 func MatchContext(orig *build.Context, filename string) (*build.Context, error) {
 	ctxt, err := buildutil.MatchContext(orig, filename, nil)
 	if ctxt != nil {
@@ -254,31 +335,80 @@ tryUnordered:
 	return true
 }
 
-func DiffContexts(orig, ctxt *build.Context) map[string]string {
-	m := make(map[string]string)
-	if ctxt.GOARCH != orig.GOARCH {
-		m["GOARCH"] = ctxt.GOARCH
+type GoEnv struct {
+	GoArch       *string `json:"GOARCH,omitempty"`
+	GoHostArch   *string `json:"GOHOSTARCH,omitempty"`
+	GoOS         *string `json:"GOOS,omitempty"`
+	GoHostOS     *string `json:"GOHOSTOS,omitempty"`
+	GoRoot       *string `json:"GOROOT,omitempty"`
+	GoPath       *string `json:"GOPATH,omitempty"`
+	CgoEnabled   *string `json:"CGO_ENABLED,omitempty"`
+	GoFlags      *string `json:"GOFLAGS,omitempty"`
+	GoExperiment *string `json:"GOEXPERIMENT,omitempty"`
+	// WARN: new
+	// GoTags       []string `json:"GOTAGS,omitempty"`
+}
+
+func DiffGoEnv(orig, ctxt *build.Context) *GoEnv {
+	p := func(s string) *string {
+		return &s
 	}
-	if ctxt.GOOS != orig.GOOS {
-		m["GOOS"] = ctxt.GOOS
+	e := new(GoEnv)
+	if ctxt.GOARCH != orig.GOARCH || ctxt.GOARCH != runtime.GOARCH {
+		e.GoArch = p(ctxt.GOARCH)
+		e.GoHostArch = p(runtime.GOARCH)
+	}
+	if ctxt.GOOS != orig.GOOS || ctxt.GOOS != runtime.GOOS {
+		e.GoOS = p(ctxt.GOOS)
+		e.GoHostOS = p(runtime.GOOS)
 	}
 	if ctxt.GOROOT != orig.GOROOT {
-		m["GOROOT"] = ctxt.GOROOT
+		e.GoRoot = p(ctxt.GOROOT)
 	}
 	if ctxt.GOPATH != orig.GOPATH {
-		m["GOPATH"] = ctxt.GOPATH
+		e.GoPath = p(ctxt.GOPATH)
 	}
 	if ctxt.CgoEnabled != orig.CgoEnabled {
-		m["CGO_ENABLED"] = strconv.FormatBool(ctxt.CgoEnabled)
+		e.CgoEnabled = p(strconv.FormatBool(ctxt.CgoEnabled))
 	}
 	if !stringsEqual(ctxt.BuildTags, orig.BuildTags) {
-		m["GOFLAGS"] = strings.Join(ctxt.BuildTags, ",")
+		// TODO: this is actually "build tags"
+		e.GoFlags = p(strings.Join(ctxt.BuildTags, ","))
 	}
 	if !stringsEqual(ctxt.ToolTags, orig.ToolTags) {
-		m["GOEXPERIMENT"] = strings.Join(ctxt.ToolTags, ",")
+		e.GoExperiment = p(strings.Join(ctxt.ToolTags, ","))
 	}
-	return m
+	return e
 }
+
+// func DiffContexts(orig, ctxt *build.Context) map[string]string {
+// 	m := make(map[string]string)
+// 	if ctxt.GOARCH != orig.GOARCH {
+// 		m["GOARCH"] = ctxt.GOARCH
+// 		m["GOHOSTARCH"] = runtime.GOARCH
+// 	}
+// 	if ctxt.GOOS != orig.GOOS {
+// 		m["GOOS"] = ctxt.GOOS
+// 		m["GOHOSTOS"] = runtime.GOOS
+// 	}
+// 	if ctxt.GOROOT != orig.GOROOT {
+// 		m["GOROOT"] = ctxt.GOROOT
+// 	}
+// 	if ctxt.GOPATH != orig.GOPATH {
+// 		m["GOPATH"] = ctxt.GOPATH
+// 	}
+// 	if ctxt.CgoEnabled != orig.CgoEnabled {
+// 		m["CGO_ENABLED"] = strconv.FormatBool(ctxt.CgoEnabled)
+// 	}
+// 	if !stringsEqual(ctxt.BuildTags, orig.BuildTags) {
+// 		// WARN: this is actually "build tags"
+// 		m["GOFLAGS"] = strings.Join(ctxt.BuildTags, ",")
+// 	}
+// 	if !stringsEqual(ctxt.ToolTags, orig.ToolTags) {
+// 		m["GOEXPERIMENT"] = strings.Join(ctxt.ToolTags, ",")
+// 	}
+// 	return m
+// }
 
 func CopyContext(orig *build.Context) *build.Context {
 	if orig == nil {
@@ -390,6 +520,20 @@ type OverlayJSON struct {
 	Replace map[string]string `json:"replace"`
 }
 
+// WARN: remove if not used
+func isFile(ctxt *build.Context, name string) bool {
+	if ctxt != nil && ctxt.OpenFile != nil {
+		f, err := ctxt.OpenFile(name)
+		if err != nil {
+			return false
+		}
+		f.Close()
+		return true
+	}
+	fi, err := os.Stat(name)
+	return err == nil && fi.Mode().IsRegular()
+}
+
 func main() {
 	ctxt := CopyContext(&build.Default)
 	ctxt.HasSubdir = contextutil.HasSubdirFunc(ctxt)
@@ -469,8 +613,8 @@ func main() {
 			if err != nil {
 				return err
 			}
-			diff := DiffContexts(&build.Default, ctxt)
-			return json.NewEncoder(os.Stdout).Encode(diff)
+			env := DiffGoEnv(&build.Default, ctxt)
+			return json.NewEncoder(os.Stdout).Encode(env)
 		},
 	}
 

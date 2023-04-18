@@ -1058,6 +1058,11 @@ class TextChange:
 
 
 class QuickPanelItem:
+    trigger = ...  # type: str
+    details = ...  # type: Union[str, List[str]]
+    annotation = ...  # type: str
+    kind = ...  # type: Tuple[int, str, str]
+
     def __init__(
         self,
         trigger: str,

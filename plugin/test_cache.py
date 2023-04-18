@@ -1,5 +1,4 @@
 import os
-import pprint
 import hashlib
 import subprocess
 from tempfile import NamedTemporaryFile
@@ -13,13 +12,15 @@ from typing import NamedTuple
 try:
     from sublime import packages_path
 except ModuleNotFoundError:
+
     def packages_path() -> str:
         return os.path.abspath(os.path.join(os.path.dirname(__file__), "tmp"))
+
 
 _mswindows = os.name == "nt"
 
 GO_CMD_DIR = os.path.abspath(os.path.join(__file__, "../../cmd"))
-GO_TEST_RUNNER_DIR = os.path.join(GO_CMD_DIR, "gotest-runner")
+GO_TEST_UTIL_DIR = os.path.join(GO_CMD_DIR, "gotest-util")
 
 
 class FileEntry(NamedTuple):
@@ -47,9 +48,9 @@ def cache_directory(dirname: str) -> Set[FileEntry]:
     return tests
 
 
-
 class TestNameCache:
     """docstring for TestNameCache"""
+
     def __init__(self, maxsize: int = 64):
         self.maxsize = maxsize
         self._cache: OrderedDict[str, str] = OrderedDict()
@@ -86,13 +87,14 @@ def check_output(
     rstrip: bool = True,
 ) -> str:
 
-    startupinfo = None
-    preexec_fn = os.setsid
     if os.name == _mswindows:
-        preexec_fn = None
         # Hide the console window on Windows
         startupinfo = subprocess.STARTUPINFO()  # type: ignore
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # type: ignore
+        preexec_fn = None
+    else:
+        startupinfo = None
+        preexec_fn = os.setsid
 
     output = subprocess.check_output(
         args,
@@ -117,18 +119,18 @@ def get_expected_version(goexe: str = "go") -> str:
     return go_version(goexe) + "-" + hash_go_files()[:8]
 
 
-def gotest_runner_exe() -> str:
+def gotest_util_exe() -> str:
     if not _mswindows:
-        testexe = "gotest-runner"
+        testexe = "gotest-util"
     else:
-        testexe = "gotest-runner.exe"
+        testexe = "gotest-util.exe"
     return os.path.join(packages_path(), "User", "GoTest", "bin", testexe)
 
 
 # TODO: run in another thread and set a variable when complete
-def install_gotest_runner(goexe: str = "go") -> None:
+def install_gotest_util(goexe: str = "go") -> None:
     expected_version = get_expected_version()
-    testexe = gotest_runner_exe()
+    testexe = gotest_util_exe()
     if os.path.exists(testexe):
         if check_output([testexe, "version"]) == expected_version:
             return
@@ -138,19 +140,19 @@ def install_gotest_runner(goexe: str = "go") -> None:
 
     # TODO: log that we are updating / building
 
-
     temp = NamedTemporaryFile(suffix=".exe", prefix=testexe + "-").name
     try:
-        ldflags=f"-ldflags=-X main.version={expected_version}"
+        ldflags = f"-ldflags=-X main.version={expected_version}"
         check_output(
             [goexe, "build", ldflags, "-o", temp],
-            cwd=GO_TEST_RUNNER_DIR,
+            cwd=GO_TEST_UTIL_DIR,
         )
         current_version = check_output([temp, "version"])
         if current_version != expected_version:
-            # WARN WARN WARN WARN WARN WARN
-            # WARN WARN WARN WARN WARN WARN
-            raise Exception("WAT")
+            raise RuntimeError(
+                (f"gotest-util: expected version: {expected_version} " +
+                 f"got version: {current_version}"),
+            )
 
         # Overwrite the old exe
         os.rename(temp, testexe)
@@ -158,28 +160,7 @@ def install_gotest_runner(goexe: str = "go") -> None:
         if os.path.exists(temp):
             os.remove(temp)
 
-    # with NamedTemporaryFile(suffix=".exe", prefix=testexe + "-") as f:
-    #     temp = f.name
-    #     f.close()  # we just want the temp name
-    #     try:
-    #         ldflags=f"-ldflags=-X main.version={expected_version}"
-    #         check_output(
-    #             [goexe, "build", ldflags, "-o", temp],
-    #             cwd=GO_TEST_RUNNER_DIR,
-    #         )
-    #         current_version = check_output([temp, "version"])
-    #         if current_version != expected_version:
-    #             # WARN WARN WARN WARN WARN WARN
-    #             # WARN WARN WARN WARN WARN WARN
-    #             raise Exception("WAT")
-
-    #         # Overwrite the old exe
-    #         os.rename(temp, testexe)
-    #     finally:
-    #         if os.path.exists(temp):
-    #             os.remove(temp)
-
 
 if __name__ == "__main__":
-    install_gotest_runner()
+    install_gotest_util()
     pass

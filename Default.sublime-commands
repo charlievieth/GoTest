@@ -2,5 +2,9 @@
     {
         "caption": "Go Test: Run tests",
         "command": "go_test_run"
+    },
+    {
+        "caption": "Exec Go Tests: Run tests",
+        "command": "run_go_tests"
     }
 ]

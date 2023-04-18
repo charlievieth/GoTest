@@ -1,11 +1,7 @@
-from pprint import pprint
-
 import hashlib
-import os
-from re import sub
-import re
-import subprocess
 import json
+import os
+import subprocess
 
 from functools import lru_cache
 from functools import wraps
@@ -66,6 +62,21 @@ _GOTEST_UTIL_EXE = os.path.join(
 )
 
 
+# WARN: remove if not used
+def build_command(prog: str, *args) -> List[str]:
+    if _mswindows:
+        _, ext = os.path.splitext(prog)
+        if not ext or ext.lower() != ".exe":
+            prog += ".exe"
+    cmd = [prog]
+    for arg in args:
+        if isinstance(arg, str):
+            cmd.append(arg)
+        else:
+            cmd.append(str(arg))
+    return cmd
+
+
 def _check_output(
     args: List[str],
     cwd: Optional[str] = None,
@@ -92,6 +103,21 @@ def _check_output(
         encoding="utf-8",
     )
     return output.rstrip() if output and rstrip else output
+
+
+# # WARN: remove if unused
+# class GoHostEnv(NamedTuple):
+#     goos: str
+#     goarch: str
+#
+#
+# # WARN: remove if unused
+# @lru_cache(maxsize=8)
+# def _go_host_env(goexe: str = "go") -> GoHostEnv:
+#     env = json.loads(
+#         _check_output([goexe, "env", "-json", "GOHOSTOS", "GOHOSTARCH"]),
+#     )
+#     return GoHostEnv(env["GOHOSTOS"], env["GOHOSTARCH"])
 
 
 @lru_cache(maxsize=8)
@@ -210,6 +236,19 @@ def check_gotest_util(goexe: str = "go") -> None:
             #     _gotest_util_installed = True
 
 
+# class RawGoEnvResponse(TypedDict, total=False):
+#     GOARCH: str
+#     GOHOSTARCH: str
+#     GOOS: str
+#     GOHOSTOS: str
+#     GOROOT: str
+#     GOPATH: str
+#     CGO_ENABLED: str
+#     GOFLAGS: str
+#     GOEXPERIMENT: str
+#     # GOTAGS: List[str]
+
+
 class RawFuncDefinition(TypedDict):
     name: str
     filename: str
@@ -218,6 +257,9 @@ class RawFuncDefinition(TypedDict):
 
 
 class RawListResponse(TypedDict):
+    pkg_name: str
+    pkg_root: str
+    go_env: Optional[Dict[str, str]]
     tests: Optional[List[RawFuncDefinition]]
     benchmarks: Optional[List[RawFuncDefinition]]
     examples: Optional[List[RawFuncDefinition]]
@@ -266,15 +308,24 @@ class FuncDefinition:
 
 
 class ListResponse:
-    __slots__ = "tests", "benchmarks", "examples", "fuzz"
+    __slots__ = (
+        "pkg_name", "pkg_root", "go_env", "tests", "benchmarks",
+        "examples", "fuzz"
+    )
 
     def __init__(
         self,
+        pkg_name: str,
+        pkg_root: str,
+        go_env: Optional[Dict[str, str]] = None,
         tests: Optional[List[FuncDefinition]] = None,
         benchmarks: Optional[List[FuncDefinition]] = None,
         examples: Optional[List[FuncDefinition]] = None,
         fuzz: Optional[List[FuncDefinition]] = None,
     ) -> None:
+        self.pkg_name = pkg_name
+        self.pkg_root = pkg_root
+        self.go_env = go_env
         self.tests = tests
         self.benchmarks = benchmarks
         self.examples = examples
@@ -291,13 +342,17 @@ class ListResponse:
     @classmethod
     def from_raw(cls, raw: Optional[RawListResponse]) -> "ListResponse":
         if raw is None:
-            return ListResponse()
+            # WARN: how do we want to handle this ???
+            return ListResponse(pkg_name="", pkg_root="")
 
         def convert(raw: RawListResponse, key: str) -> Optional[List[FuncDefinition]]:
             v = cast(Optional[List[RawFuncDefinition]], raw.get(key, None))
             return [FuncDefinition.from_raw(d) for d in v] if v else None
 
         return ListResponse(
+            pkg_name=raw["pkg_name"],
+            pkg_root=raw["pkg_root"],
+            go_env=raw.get("go_env"),
             tests=convert(raw, "tests"),
             benchmarks=convert(raw, "benchmarks"),
             examples=convert(raw, "examples"),
@@ -306,11 +361,27 @@ class ListResponse:
 
     def to_raw(self) -> RawListResponse:
         return {
+            "pkg_name": self.pkg_name,
+            "pkg_root": self.pkg_root,
+            "go_env": self.go_env,
             "tests": [d.to_raw() for d in self.tests or []],
             "benchmarks": [d.to_raw() for d in self.benchmarks or []],
             "examples": [d.to_raw() for d in self.examples or []],
             "fuzz": [d.to_raw() for d in self.fuzz or []],
         }
+
+    # TODO: rename / remove
+    def environ(self, remove_platform_vars: bool = False) -> Optional[Dict[str, str]]:
+        if self.go_env:
+            env = os.environ.copy()
+            env.update(self.go_env)
+            if remove_platform_vars:
+                if "GOOS" in env and "GOHOSTOS" in env:
+                    env["GOOS"] = env.pop("GOHOSTOS")
+                if "GOARCH" in env and "GOHOSTARCH" in env:
+                    env["GOARCH"] = env.pop("GOHOSTARCH")
+            return env
+        return None
 
 
 FuncT = TypeVar('FuncT', bound=Callable[..., Any])
@@ -363,7 +434,8 @@ def view_src(view: View) -> str:
     return view.substr(Region(0, view.size())) if view else ""
 
 
-def overlay(views: List[View]) -> Optional[Dict[str, str]]:
+# TODO: rename
+def view_overlay(views: List[View]) -> Optional[Dict[str, str]]:
     replace: Optional[Dict[str, str]] = None
     for view in views:
         if view is not None and view.is_dirty() and not view.is_scratch():
@@ -376,6 +448,12 @@ def overlay(views: List[View]) -> Optional[Dict[str, str]]:
     return replace
 
 
+def _overlay_arg(overlay: Optional[Dict[str, str]] = None) -> List[str]:
+    if overlay:
+        return ["--overlay", json.dumps({"replace": overlay})]
+    return []
+
+
 # WARN: need to rebuild on change
 #
 # TODO: include func and method names as well so that we can better
@@ -385,42 +463,29 @@ def list_tests(
     filename: str,
     overlay: Optional[Dict[str, str]] = None,
 ) -> ListResponse:
-    if overlay:
-        extra = ["--overlay", json.dumps({"replace": overlay})]
-    else:
-        extra = []
     data = _check_output(
-        [_GOTEST_UTIL_EXE] + extra + ["list", filename],
+        [_GOTEST_UTIL_EXE] + _overlay_arg(overlay) + ["list", filename],
         cwd=os.path.dirname(filename),
     )
     return ListResponse.from_raw(json.loads(data))
 
-    # print("#########")
-    # print(data)
-    # print("#########")
-    # dec = json.JSONDecoder()
-    # tests: List[RawFuncDefinition] = []
-    # while data:
-    #     t, n = dec.raw_decode(data)
-    #     data = data[n:]
-    #     tests.append(t)
-    # return [FuncDefinition.from_raw(test) for test in tests]
-    # # except subprocess.CalledProcessError as e:
 
+@requires_gotest_exe
+def test_env(
+    filename: str,
+    overlay: Optional[Dict[str, str]] = None,
+) -> Optional[Dict[str, str]]:
+    data = _check_output(
+        [_GOTEST_UTIL_EXE] + _overlay_arg(overlay) + ["env", filename],
+        cwd=os.path.dirname(filename),
+    )
+    go_env = json.loads(data)
+    if go_env:
+        env = os.environ.copy()
+        env.update(go_env)
+        return env
+    return None  # Default env
 
-XXX_TEST = """
-package strings
-
-import "testing"
-
-func TestXXX(t *testing.T) {
-    t.Fatal("WAT")
-}
-"""
-
-BAD_TEST = """
-asdads
-"""
 
 if __name__ == "__main__":
     import sys
@@ -440,3 +505,21 @@ if __name__ == "__main__":
 
     # tests = list_tests(name, overlay=overlay)
     # json.dump(tests, sys.stdout, indent=4)
+
+
+# def _run_command(
+#     name: str,
+#     args: Union[str, List[str], None] = None,
+#     overlay: Optional[Dict[str, str]] = None,
+# ) -> Dict[str, Any]:
+#     cmd = [_GOTEST_UTIL_EXE]
+#     if overlay:
+#         cmd += ["--overlay", json.dumps({"replace": overlay})]
+#     if args is not None:
+#         if isinstance(args, str):
+#             cmd.append(args)
+#         elif isinstance(args, list):
+#             cmd.extend(args)
+#         else:
+#             raise ValueError("invalid arg type")
+#     return {}

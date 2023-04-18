@@ -6,9 +6,10 @@ import os
 import re
 import subprocess
 import functools
+import html
 
 from enum import Enum
-from typing import Any
+from typing import Any, Tuple
 from typing import AnyStr
 from typing import Dict
 from typing import KeysView
@@ -44,10 +45,10 @@ logger = get_logger()
 
 # REPLACE_FILENAME_LINE_RE = re.compile(r"(^\s*\w+\.go:\d+: )")
 REPLACE_FILENAME_LINE_RE = re.compile(r"^\s+.*?\.go:\d+: ")
-FILENAME_LINE_FAILURE_RE = re.compile(r"^[    ]{1,}(\w+\.go):(\d+)\:\s+(.*)")
-TEST_REPORT_RE = re.compile(r"^[    ]{0,}--- (PASS|FAIL|SKIP|BENCH): \w+")
-TEST_UPDATE_RE = re.compile(r"^=== (RUN|PAUSE|CONT)\s+")
-TEST_NAME_RE = re.compile(r"^(?:Test|Benchmark|Example|Fuzz)\w+", re.MULTILINE)
+FILENAME_LINE_FAILURE_RE = re.compile(r"^[    ]{1,}(.+?\.go):(\d+): (.*)")
+TEST_REPORT_RE = re.compile(r"^[    ]{0,}--- (?:PASS|FAIL|SKIP|BENCH): .+")
+# TEST_REPORT_RE = re.compile(r"^[    ]{0,}--- (PASS|FAIL|SKIP|BENCH): \w+")
+TEST_UPDATE_RE = re.compile(r"^=== (?:RUN|PAUSE|CONT)\s+")
 
 # PROGRESS_SPINNER_CHARS = ["◐", "◓", "◑", "◒"]
 PROGRESS_SPINNER_CHARS = "◓◑◒◐"
@@ -559,7 +560,7 @@ def match_view(view: Optional[sublime.View]) -> bool:
 def view_window(view: Optional[sublime.View]) -> Optional[sublime.Window]:
     if view and view.is_valid():
         window = view.window()
-        if window.is_valid():
+        if window and window.is_valid():
             return window
     return None
 
@@ -579,6 +580,7 @@ class GoTestRun(sublime_plugin.WindowCommand):
     STATUS_KEY = "000_GoTest"  # TODO: use request_id for this
     ALL_TESTS = "All Tests"
     SHORT_TESTS = "Short Tests"
+    ANNOTATION_KEY = "GoTest"
 
     def is_enabled(self) -> bool:
         return match_view(self.window.active_view())
@@ -657,17 +659,148 @@ class GoTestRun(sublime_plugin.WindowCommand):
     ) -> Optional[sublime.View]:
         window = view_window(view)
         if window is None:
-            return
+            return None
         flags = sublime.ENCODED_POSITION
         if transient:
             # flags |= sublime.TRANSIENT
             flags |= sublime.FORCE_GROUP
             flags |= sublime.REPLACE_MRU | sublime.SEMI_TRANSIENT
         else:
-            view.run_command("add_jump_record", {"selection": [(r.a, r.b) for r in view.sel()]})
+            view.run_command(
+                "add_jump_record", {"selection": [(r.a, r.b) for r in view.sel()]}
+            )
 
         group = window.active_group()
         return window.open_file(f"{filename}:{line}", flags=flags, group=group)
+
+    def _same_file(self, p1: str, p2: str) -> bool:
+        return p1 == p2 or os.path.basename(p1) == os.path.basename(p2)
+
+    class _LineError:
+        __slots__ = "line", "error"
+
+        def __init__(self, line: int, error: str) -> None:
+            self.line = line
+            self.error = error
+
+    def _update_view_annotations(self, view: sublime.View, test_failures: List[Test]) -> None:
+        # WARN: DEV ONLY
+        logger.warning("update_view_annotations")
+
+        stylesheet = '''
+            <style>
+                #annotation-error {
+                    background-color: color(var(--background) blend(#fff 95%));
+                }
+                html.dark #annotation-error {
+                    background-color: color(var(--background) blend(#fff 95%));
+                }
+                html.light #annotation-error {
+                    background-color: color(var(--background) blend(#000 85%));
+                }
+                a {
+                    text-decoration: inherit;
+                }
+            </style>
+        '''
+
+        filename = view_filename(view)
+        if not filename:
+            return
+        failures: List[Failure] = []
+        for t in test_failures:
+            for ff in t.failures or []:
+                if self._same_file(filename, ff.filename):
+                    failures.append(ff)
+
+        failures = sorted(failures, key=lambda ff: ff.line)
+
+        selection_set: List[sublime.Region] = []
+        content_set: List[str] = []
+        line_err_set: List["GoTestRun._LineError"] = []
+        for ff in failures:
+            if not ff.combined_output:
+                continue
+            # WARN: need to fix column
+            pt = view.text_point(ff.line - 1, 0)
+            if line_err_set and ff.line == line_err_set[-1].line:
+                # WARN: make sure this works
+                line_err_set[-1].error += "<br>" + html.escape(
+                    ff.combined_output, quote=False,
+                )
+            else:
+                # pt_b = pt + 1
+                r = view.expand_by_class(pt, sublime.CLASS_WORD_START | sublime.CLASS_LINE_END)
+                pt_a = r.b
+                r = view.expand_by_class(pt, sublime.CLASS_LINE_END)
+                pt_b = r.b
+
+                # if view.classify(pt) & sublime.CLASS_WORD_START:
+                #     pt_b = view.find_by_class(
+                #         pt, forward=True, classes=(sublime.CLASS_WORD_END)
+                #     )
+                # if pt_b <= pt:
+                #     pt_b = pt + 1
+                # selection_set.append(sublime.Region(pt, pt_b))
+                selection_set.append(sublime.Region(pt_a, pt_b))
+
+                # line_err_set.append([ff.line, html.escape(ff.combined_output, quote=False)])
+                line_err_set.append(
+                    self._LineError(ff.line, html.escape(ff.combined_output, quote=False),
+                ))
+
+        logger.warning("### line_err_set:")
+        pprint(line_err_set)
+        logger.warning("###")
+        for le in line_err_set:
+            content_set.append(
+                "<body>"
+                + stylesheet
+                + '<div class="error" id=annotation-error>'
+                + '<span class="content">'
+                + le.error
+                + "</span></div>"
+                + "</body>"
+            )
+
+        view.add_regions(
+            self.ANNOTATION_KEY,
+            selection_set,
+            scope="invalid",
+            annotations=content_set,
+            icon="dot",
+            flags=(
+                sublime.DRAW_SQUIGGLY_UNDERLINE
+                | sublime.DRAW_NO_FILL
+                | sublime.DRAW_NO_OUTLINE
+            ),
+            on_close=lambda: self._hide_annotations(test_failures),
+        )
+
+    def _hide_annotations(self, test_failures: List[Test]) -> None:
+        if not test_failures:
+            return
+
+        files_with_errs = set()
+        for test in test_failures:
+            for ff in test.failures or []:
+                files_with_errs.add(ff.filename)
+
+        for window in sublime.windows():
+            for file in files_with_errs:
+                view = window.find_open_file(file)
+                if view:
+                    view.erase_regions(self.ANNOTATION_KEY)
+                    view.hide_popup()
+
+        view = sublime.active_window().active_view()
+        if view:
+            view.erase_regions("exec")
+            view.hide_popup()
+
+        self.errs_by_file = {}
+        self.annotation_sets_by_buffer = {}
+        self.show_errors_inline = False
 
     def handle_test_output(
         self,
@@ -693,7 +826,7 @@ class GoTestRun(sublime_plugin.WindowCommand):
         if any(not ff.failures for ff in failures):
             logger.error(
                 "tests with no failures: %s",
-                [ff.full_name for ff in failures if not ff.failures]
+                [ff.full_name for ff in failures if not ff.failures],
             )
             failures = [ff for ff in failures if ff.failures]
 
@@ -704,13 +837,13 @@ class GoTestRun(sublime_plugin.WindowCommand):
             view.set_status(self.STATUS_KEY, f"Found {len(failures)} test failures")
 
             # TODO: use the index for this
-            test_files = {
-                tt.name: tt for tt in test_funcs.tests or []
-            }
-            items: List[sublime.QuickPanelItem] = [sublime.QuickPanelItem(
-                trigger=f"Found {len(failures)} test failures",
-                kind=sublime.KIND_VARIABLE,
-            )]
+            test_files = {tt.name: tt for tt in test_funcs.tests or []}
+            items: List[sublime.QuickPanelItem] = [
+                sublime.QuickPanelItem(
+                    trigger=f"Found {len(failures)} test failures",
+                    kind=sublime.KIND_VARIABLE,
+                )
+            ]
             for test in failures:
                 failure = test.failures[0]
                 items.append(
@@ -723,6 +856,7 @@ class GoTestRun(sublime_plugin.WindowCommand):
                 )
 
             highlighted_view: Optional[sublime.View] = None
+
             def _on_select(index: int, transient: bool) -> None:
                 # WARN WARN WARN
                 logger.warning(f"on_select: index: {index} transient: {transient}")
@@ -735,7 +869,7 @@ class GoTestRun(sublime_plugin.WindowCommand):
                         filename = test.failures[0].filename
                         line = test.failures[0].line
                     else:
-                        logger.error(f"WTF: {test!s}")
+                        logger.error(f"WTF: {test!s}")  # WARN: remove
                         func = test_files[test.name]
                         filename = func.filename
                         line = func.line
@@ -744,6 +878,7 @@ class GoTestRun(sublime_plugin.WindowCommand):
                     new_view = self.jump_to_location(view, filename, line, transient)
                     if new_view:
                         highlighted_view = new_view
+                        self._update_view_annotations(view, failures)
                 else:
                     window = view_window(view)
                     if window is not None:
