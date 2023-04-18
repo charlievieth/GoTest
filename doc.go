@@ -1,0 +1,2 @@
+// dummy package
+package gotest

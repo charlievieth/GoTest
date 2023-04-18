@@ -1,7 +1,11 @@
+# WARN WARN WARN WARN
+from pprint import pprint
+
 import json
 import os
 import re
 import subprocess
+import functools
 
 from enum import Enum
 from typing import Any
@@ -12,6 +16,7 @@ from typing import List
 from typing import NamedTuple
 from typing import Optional
 from typing import TypedDict
+from typing import Union
 from typing import cast
 from subprocess import CompletedProcess
 
@@ -20,17 +25,43 @@ from subprocess import CompletedProcess
 
 from .plugin.logger import get_logger
 from .plugin.exec import AsyncProcess
+from .plugin.exec import Callback
+from .plugin.testutil import list_tests
+from .plugin.testutil import test_env
+from .plugin.testutil import view_overlay
+from .plugin.testutil import ListResponse
+from .plugin.testutil import FuncDefinition
+from .plugin.utils import view_file_name
 
 import sublime
 import sublime_plugin
 
+# WARN WARN WARN
+import Default.exec
+
 
 logger = get_logger()
 
-REPLACE_FILENAME_LINE_RE = re.compile(r"(^\s*\w+\.go:\d+: )")
+# REPLACE_FILENAME_LINE_RE = re.compile(r"(^\s*\w+\.go:\d+: )")
+REPLACE_FILENAME_LINE_RE = re.compile(r"^\s+.*?\.go:\d+: ")
 FILENAME_LINE_FAILURE_RE = re.compile(r"^[    ]{1,}(\w+\.go):(\d+)\:\s+(.*)")
 TEST_REPORT_RE = re.compile(r"^[    ]{0,}--- (PASS|FAIL|SKIP|BENCH): \w+")
 TEST_UPDATE_RE = re.compile(r"^=== (RUN|PAUSE|CONT)\s+")
+TEST_NAME_RE = re.compile(r"^(?:Test|Benchmark|Example|Fuzz)\w+", re.MULTILINE)
+
+# PROGRESS_SPINNER_CHARS = ["◐", "◓", "◑", "◒"]
+PROGRESS_SPINNER_CHARS = "◓◑◒◐"
+# MSG_CHARS_COLOR_SUBLIME = u'⣾⣽⣻⢿⡿⣟⣯⣷'
+
+
+PREVIEW_PANE_CSS = """
+    .diagnostics {padding: 0.5em}
+    .diagnostics a {color: var(--bluish)}
+    .diagnostics.error {background-color: color(var(--redish) alpha(0.25))}
+    .diagnostics.warning {background-color: color(var(--yellowish) alpha(0.25))}
+    .diagnostics.info {background-color: color(var(--bluish) alpha(0.25))}
+    .diagnostics.hint {background-color: color(var(--bluish) alpha(0.25))}
+    """
 
 
 class LineError(NamedTuple):
@@ -174,6 +205,26 @@ class Failure:
                 args.append(f"{attr}={v!r}")
         return f"{self.__class__.__name__}({', '.join(args)})"
 
+    def to_dict(self) -> Dict[str, Any]:
+        m = {}
+        for attr in self.__slots__:
+            v = getattr(self, attr)
+            if v is not None:
+                m[attr] = v
+        return m
+
+    def short_error_msg(self) -> str:
+        if self.combined_output:
+            if "\n" not in self.combined_output:
+                return self.combined_output.strip()
+            else:
+                # find the first non-empty line
+                for line in self.combined_output.split("\n"):
+                    line = line.strip()
+                    if line:
+                        return line
+        return ""
+
 
 # def count_leading_spaces(s: str) -> int:
 #     for i, c in enumerate(s):
@@ -200,8 +251,7 @@ def parse_combined_output(f: Failure) -> str:
             break
 
     combined = [
-        (s[len(prefix) :] if s.startswith(prefix) else s).rstrip("\n")
-        for s in f.output
+        (s[len(prefix) :] if s.startswith(prefix) else s).rstrip("\n") for s in f.output
     ]
     combined[0] = REPLACE_FILENAME_LINE_RE.sub("", combined[0])
 
@@ -210,7 +260,7 @@ def parse_combined_output(f: Failure) -> str:
 
 # TODO: rename ???
 class Test:
-    __slots__ = "name", "package", "status", "failures"
+    __slots__ = "_name", "package", "status", "failures"
 
     def __init__(
         self,
@@ -219,13 +269,52 @@ class Test:
         status: TestAction,
         failures: List[Failure] = [],
     ):
-        self.name = name
+        self._name = name
         self.package = package
         self.status = status
         self.failures = failures
+        # self.failures = sorted(failures, key=lambda ff: ff.line)
 
+    @property
+    def full_name(self) -> str:
+        return self._name
+
+    @property
     def is_subtest(self) -> bool:
-        return "/" in self.name
+        return "/" in self._name
+
+    @property
+    def name(self) -> str:
+        if self.is_subtest:
+            return self._name.split("/", 1)[0]
+        else:
+            return self._name
+
+    def __repr__(self) -> str:
+        args = []
+        for attr in self.__slots__:
+            v = getattr(self, attr)
+            if v is not None:
+                args.append(f"{attr}={v!r}")
+        return f"{self.__class__.__name__}({', '.join(args)})"
+
+    # WARN: debug only
+    def to_dict(self) -> Dict[str, Any]:
+        if self.failures:
+            failures = [f.to_dict() for f in self.failures]
+        else:
+            failures = None
+        return {
+            "name": self.name,
+            "full_name": self.full_name,
+            "package": self.package,
+            "status": str(self.status),
+            "failures": failures,
+        }
+
+    # WARN: debug only
+    def to_json(self, indent: Optional[int] = None) -> str:
+        return json.dumps(self.to_dict(), indent=indent)
 
     @classmethod
     def _final_action(cls, events: List[TestEvent]) -> Optional[TestAction]:
@@ -317,6 +406,29 @@ class Test:
             failures=failures,
         )
 
+    @classmethod
+    def from_test_output(
+        cls,
+        output: str,
+        all_tests: bool = False,
+    ) -> "List[Test]":
+        # dec = json.JSONDecoder(object_hook=TestEvent._from_raw_json)
+        # events = []
+        # while output:
+        #     e, i = dec.raw_decode(output)
+        #     output = output[i:]
+        #     events.append(e)
+        o = RawTestOutput.from_events(
+            [TestEvent.from_json(line) for line in output.split("\n") if line]
+        )
+        tests: List[Test] = []
+        for raw_tests in o.pkgs.values():
+            for events in raw_tests.values():
+                tt = Test.from_events(events)
+                if all_tests or (tt.status is TestAction.FAIL and tt.failures):
+                    tests.append(tt)
+        return tests
+
 
 class RawTestOutput:
     __slots__ = "pkgs"
@@ -337,7 +449,7 @@ class RawTestOutput:
                 self.pkgs[ev.package][ev.test] = []
             self.pkgs[ev.package][ev.test].append(ev)
 
-    def add_test(self, pkg: str, name: str, events: list[TestEvent]) -> None:
+    def add_test(self, pkg: str, name: str, events: List[TestEvent]) -> None:
         if pkg not in self.pkgs:
             self.pkgs[pkg] = {}
         self.pkgs[pkg][name] = events.copy()
@@ -385,9 +497,7 @@ class Package:
 
     def failures(self) -> List[Test]:
         if self._tests is not None:
-            return [
-                t for t in self._tests.values() if t.status is TestAction.FAIL
-            ]
+            return [t for t in self._tests.values() if t.status is TestAction.FAIL]
         return []
 
 
@@ -429,65 +539,372 @@ def run_tests_new() -> List[TestEvent]:
         # include STDERR
         proc.check_returncode()
 
-    return [
-        TestEvent.from_json(line) for line in proc.stdout.split("\n") if line
-    ]
+    return [TestEvent.from_json(line) for line in proc.stdout.split("\n") if line]
 
 
-def match_view(view: sublime.View, selector: str) -> bool:
-    syntax = view.syntax()
-    if not syntax:
-        return False
-    return sublime.score_selector(syntax.scope, selector) > 1
+def match_view(view: Optional[sublime.View]) -> bool:
+    if view and not view.is_scratch():
+        syntax = view.syntax()
+        if syntax:
+            # Every part of a x.y.z scope seems to contribute 8.
+            # An empty selector result in a score of 1.
+            # A non-matching non-empty selector results in a score of 0.
+            #
+            # We want to match at least one part of an x.y.z, and we don't
+            # want to match on empty selectors.
+            return sublime.score_selector(syntax.scope, "source.go") >= 8
+    return False
+
+
+def view_window(view: Optional[sublime.View]) -> Optional[sublime.Window]:
+    if view and view.is_valid():
+        window = view.window()
+        if window.is_valid():
+            return window
+    return None
+
+
+def view_filename(view: Optional[sublime.View]) -> str:
+    if view is None:
+        return ""
+    return view.file_name() or ""
+
+
+def view_src(view: sublime.View) -> str:
+    """Returns the string source of the Sublime view."""
+    return view.substr(sublime.Region(0, view.size())) if view else ""
 
 
 class GoTestRun(sublime_plugin.WindowCommand):
+    STATUS_KEY = "000_GoTest"  # TODO: use request_id for this
+    ALL_TESTS = "All Tests"
+    SHORT_TESTS = "Short Tests"
 
     def is_enabled(self) -> bool:
-        return self._match_view(self.window.active_view())
+        return match_view(self.window.active_view())
 
     def run(self) -> None:
         view = self.window.active_view()
-        if not self._match_view(view):
-            logger.warning("not enabled for view: %s", self._view_filename(view))
-            return
-        self._test_names(view)
-
-    def _view_filename(self, view: Optional[sublime.View]) -> str:
-        return view.file_name() or "" if view is not None else ""
-
-    def _match_view(self, view: Optional[sublime.View]) -> bool:
-        if view is None or view.is_scratch():
-            return False
-        return match_view(view, "source.go")
-
-    def _test_names(self, view: sublime.View) -> None:
-        dirname = os.path.dirname(self._view_filename(view))
-        if not os.path.isdir(dirname):
-            logger.warning("directory does not exist: %s", dirname)
+        if view is None:
             return
 
-        def callback(proc: Optional[CompletedProcess], exc: Optional[Exception]) -> None:
-            if exc is not None:
-                logger.exception(f"failed to list tests: {exc}", exc_info=exc)
-            elif proc is None:
-                logger.error("both CompletedProcess and Exception are None")
+        if not match_view(view):
+            logger.warning("not enabled for view: %s", view_file_name(view))
+            return
+
+        self.package_test_names(view)
+
+    # TODO: set status for all views in the window
+    # TODO: use a spinner to show that it's running
+    def clear_status_callback(
+        self,
+        view: sublime.View,
+        cb: Callback,
+        async_delay: Optional[int] = None,
+    ) -> Callback:
+        def outer(proc: Optional[CompletedProcess], exc: Optional[Exception]) -> None:
+            try:
+                cb(proc, exc)
+            finally:
+                if not view.get_status(self.STATUS_KEY):
+                    return
+                if async_delay is not None:
+                    sublime.set_timeout_async(
+                        lambda: view.erase_status(self.STATUS_KEY),
+                        async_delay,
+                    )
+                else:
+                    view.erase_status(self.STATUS_KEY)  # TODO: use request_id for this
+
+        return outer
+
+    def quick_panel_items(self, tests: ListResponse) -> List[sublime.QuickPanelItem]:
+        if not tests or not tests.tests:
+            return []
+
+        items = [
+            sublime.QuickPanelItem(
+                trigger=self.ALL_TESTS,
+                details="run all tests",
+                # annotation="ANNOTATION: 1",
+                kind=sublime.KIND_VARIABLE,
+            ),
+            sublime.QuickPanelItem(
+                trigger=self.SHORT_TESTS,
+                details="run short tests",
+                # annotation="",
+                kind=sublime.KIND_VARIABLE,
+            ),
+        ]
+        for test in tests.tests:
+            items.append(
+                sublime.QuickPanelItem(
+                    trigger=test.name,
+                    details=os.path.basename(test.filename),
+                    # TODO: what should we use for the annotation ???
+                    # annotation=loc.syntax if loc else "",
+                    kind=sublime.KIND_FUNCTION,
+                )
+            )
+        return items
+
+    def jump_to_location(
+        self,
+        view: sublime.View,
+        filename: str,
+        line: int,
+        transient: bool = False,
+    ) -> Optional[sublime.View]:
+        window = view_window(view)
+        if window is None:
+            return
+        flags = sublime.ENCODED_POSITION
+        if transient:
+            # flags |= sublime.TRANSIENT
+            flags |= sublime.FORCE_GROUP
+            flags |= sublime.REPLACE_MRU | sublime.SEMI_TRANSIENT
+        else:
+            view.run_command("add_jump_record", {"selection": [(r.a, r.b) for r in view.sel()]})
+
+        group = window.active_group()
+        return window.open_file(f"{filename}:{line}", flags=flags, group=group)
+
+    def handle_test_output(
+        self,
+        view: sublime.View,
+        test_funcs: ListResponse,
+        proc: Optional[subprocess.CompletedProcess] = None,
+        exc: Optional[Exception] = None,
+    ) -> None:
+        view.erase_status(self.STATUS_KEY)  # Clear the "Running tests" status
+        if exc:
+            # TODO: handle this and highlint errors
+            if isinstance(exc, subprocess.CalledProcessError):
+                sublime.error_message(f"Exception: {exc}\n###\n{exc.stderr}\n###")
             else:
-                print("### Stdout:")
-                print(proc.stdout)
-                print("###")
+                sublime.error_message(f"Exception: {exc}")
+            return
+        if not proc:
+            raise ValueError("either proc or exc should be supplied")
 
-        proc = AsyncProcess(
-            cmd=["go", "test", "-list", "."],
-            callback=callback,
-            cwd=dirname,
+        failures = Test.from_test_output(proc.stdout)
+
+        # WARN: dev only
+        if any(not ff.failures for ff in failures):
+            logger.error(
+                "tests with no failures: %s",
+                [ff.full_name for ff in failures if not ff.failures]
+            )
+            failures = [ff for ff in failures if ff.failures]
+
+        if not failures:
+            # WARN: signal that all tests passed
+            view.set_status(self.STATUS_KEY, "All tests passed")
+        else:
+            view.set_status(self.STATUS_KEY, f"Found {len(failures)} test failures")
+
+            # TODO: use the index for this
+            test_files = {
+                tt.name: tt for tt in test_funcs.tests or []
+            }
+            items: List[sublime.QuickPanelItem] = [sublime.QuickPanelItem(
+                trigger=f"Found {len(failures)} test failures",
+                kind=sublime.KIND_VARIABLE,
+            )]
+            for test in failures:
+                failure = test.failures[0]
+                items.append(
+                    sublime.QuickPanelItem(
+                        trigger=test.full_name,
+                        details=f"<code>{failure.output[0]}</code>",
+                        annotation=os.path.basename(failure.filename),
+                        kind=sublime.KIND_FUNCTION,
+                    )
+                )
+
+            highlighted_view: Optional[sublime.View] = None
+            def _on_select(index: int, transient: bool) -> None:
+                # WARN WARN WARN
+                logger.warning(f"on_select: index: {index} transient: {transient}")
+
+                nonlocal highlighted_view
+                # Index 0 is the test message
+                if index > 0:
+                    test = failures[index - 1]
+                    if test.failures:
+                        filename = test.failures[0].filename
+                        line = test.failures[0].line
+                    else:
+                        logger.error(f"WTF: {test!s}")
+                        func = test_files[test.name]
+                        filename = func.filename
+                        line = func.line
+                    # func = test_files[test.name]
+                    # new_view = self.jump_to_location(view, func.filename, func.line, transient)
+                    new_view = self.jump_to_location(view, filename, line, transient)
+                    if new_view:
+                        highlighted_view = new_view
+                else:
+                    window = view_window(view)
+                    if window is not None:
+                        window.focus_view(view)
+                    # on_select is called with -1 when the panel is closed
+                    if not transient and highlighted_view:
+                        sheet = highlighted_view.sheet()
+                        if sheet and sheet.is_semi_transient():
+                            highlighted_view.close()
+
+            self.window.show_quick_panel(
+                items=items,
+                on_select=lambda index: _on_select(index, transient=False),
+                selected_index=-1,
+                on_highlight=lambda index: _on_select(index, transient=True),
+                placeholder="Test failures",
+                flags=sublime.KEEP_OPEN_ON_FOCUS_LOST,
+            )
+            # for tt in tests:
+            #     pass
+        sublime.set_timeout_async(lambda: view.erase_status(self.STATUS_KEY), 5000)
+
+    def handle_test_output_callback(
+        self,
+        view: sublime.View,
+        test_funcs: ListResponse,
+    ) -> Callback:
+        def callback(
+            proc: Optional[subprocess.CompletedProcess] = None,
+            exc: Optional[Exception] = None,
+        ) -> None:
+            self.handle_test_output(view, test_funcs, proc, exc)
+
+        return callback
+
+    def package_test_names(self, view: sublime.View) -> None:
+        filename = view_file_name(view)
+        dirname = os.path.dirname(filename)
+        if not os.path.isdir(dirname):
+            # TODO: notify user
+            logger.warning("directory does not exist: %s", dirname)
+            sublime.error_message(
+                "Error: directory does not exist: {}".format(dirname),
+            )
+            return
+
+        # TODO: handle exceptions
+        tests = list_tests(filename, view_overlay([view]))
+        if tests is None or not tests.tests:
+            # TODO: log that there are no tests to run
+            sublime.error_message(
+                "Warn: no tests for: {}".format(os.path.basename(filename)),
+            )
+            return
+
+        items = self.quick_panel_items(tests)
+        if not items:
+            return  # This should never happen
+
+        def on_select(index: int) -> None:
+            # TODO: run the tests async instead of setting a var
+            if index < 0:
+                return
+
+            cmd = ["go", "test", "-json"]
+            it = items[index]
+            if it.trigger == self.ALL_TESTS:
+                pass
+            elif it.trigger == self.SHORT_TESTS:
+                cmd.append("-short")
+            else:
+                cmd += ["-run", f"^{it.trigger}$"]
+
+            sublime.set_timeout_async(
+                AsyncProcess(
+                    cmd=cmd,
+                    callback=self.handle_test_output_callback(view, tests),
+                    cwd=dirname,
+                    env=tests.environ(),
+                ).run
+            )
+            view.set_status(self.STATUS_KEY, "Running tests...")
+
+        self.window.show_quick_panel(
+            items=items,
+            on_select=on_select,
+            placeholder="All Tests",
         )
-        sublime.set_timeout_async(proc.run, 1)
+
+        return
 
     def _run_tests(self, view: sublime.View) -> None:
         # TODO: save file before running?
         pass
 
 
+# WARN WARN WARN
+class RunGoTestsCommand(Default.exec.ExecCommand):
+    # Taken from "C++/C Single File.sublime-build"
+    # TODO: the column is wrong
+    FILE_REGEX = r"^(?:\s+)(..[^:]*):([0-9]+):?([0-9]+)?:? (.*)$"
+    # FILE_REGEX = r"^(?:\s+)(..[^:]*):([0-9]+): (.*)$"
+
+    # FILE_REGEX = r"^(?:    )+(\w+\.go)(?=:\d+: )"
+    # LINE_REGEX = r"^(?:    )+(?:\w+\.go:)(\d+)(?=: )"
+
+    def run(self, **kwargs) -> None:
+        view = self.window.active_view()
+        if not view:
+            return
+        file_name = view.file_name()
+        if not file_name:
+            return
+
+        # Determine the working directory
+        working_dir = kwargs.get("working_dir", None)
+        if not working_dir:
+            working_dir = os.path.dirname(file_name)
+
+        # Determine the environment variables
+        env = os.environ.copy()
+        custom_env = kwargs.get("env", None)
+        if custom_env:
+            env.update(custom_env)
+
+        # Delegate to the super class
+        super().run(
+            cmd=["go", "test"],
+            file_regex=self.FILE_REGEX,
+            # line_regex=self.LINE_REGEX,
+            working_dir=working_dir,
+            env=env,
+        )
+
+        def print_errors() -> None:
+            print(f"errs_by_file: {len(self.errs_by_file)}")
+            pprint(self.errs_by_file)
+
+        sublime.set_timeout_async(print_errors, 3000)
+
+
 def plugin_loaded() -> None:
+    # TODO: install gotest-util if it does not exist since this should
+    # be called right after install and we should have network access
+    # then.
+    #
+    # print(f"packages_path: {sublime.packages_path()}")
     pass
+
+
+# try:
+#     proc = AsyncProcess(
+#         cmd=["go", "test", "-list", "."],
+#         callback=self.clear_status_callback(view, self.test_names_callback),
+#         cwd=dirname,
+#     )
+#     view.set_status(self.STATUS_KEY, "Fetching go test names")
+#     # TODO: does this need to be async since we use a thread?
+#     sublime.set_timeout_async(proc.run, 1)
+# except FileNotFoundError as exc:
+#     sublime.error_message("Error: Go is not installed: {}".format(exc))
+# except Exception as exc:
+#     logger.exception("failed to fetch test names")
+#     sublime.error_message("Error: fetching test names: {}".format(exc))
